@@ -224,6 +224,8 @@ if TYPE_CHECKING:
     ] = "relax"
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = True
+    VLLM_INKLING2_DRAFT_VOCAB: str | None = None
+    VLLM_INKLING2_DRAFT_VOCAB_SIZE: int = 65536
     VLLM_STEP5_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
@@ -1739,6 +1741,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Under DP, TRT-LLM block-FP8/MXFP8 monolithic MoE then takes vLLM's
     # routing instead of routing from logits; 0 restores the kernel's routing.
     "VLLM_MOE_SKIP_PADDING": lambda: bool(int(os.getenv("VLLM_MOE_SKIP_PADDING", "1"))),
+    # Inkling 2 DSpark: torch file of token ids (most frequent first) that the
+    # drafter scores instead of the full vocabulary; output-preserving.
+    "VLLM_INKLING2_DRAFT_VOCAB": lambda: os.getenv("VLLM_INKLING2_DRAFT_VOCAB"),
+    # How many leading ids of VLLM_INKLING2_DRAFT_VOCAB to use.
+    "VLLM_INKLING2_DRAFT_VOCAB_SIZE": lambda: int(
+        os.getenv("VLLM_INKLING2_DRAFT_VOCAB_SIZE", "65536")
+    ),
     # Step5 SP dense/shared MLPs: opt into TP-sharded weights with AG/RS
     # instead of replicated weights and local-token computation.
     "VLLM_STEP5_SHARD_SP_SHARED_EXPERT": lambda: bool(

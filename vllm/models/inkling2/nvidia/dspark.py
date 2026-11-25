@@ -11,6 +11,7 @@ from typing import cast
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
@@ -343,6 +344,10 @@ class Inkling2MarkovHead(nn.Module):
         self.fold_weight: torch.Tensor | None = None
         self.fold_bias: torch.Tensor | None = None
         self.rnn_bias: torch.Tensor | None = None
+        # Rows of fold_weight/fold_bias for the draft vocabulary, when set
+        # (see Inkling2DSpark._refresh_draft_vocab).
+        self.vocab_fold_weight: torch.Tensor | None = None
+        self.vocab_fold_bias: torch.Tensor | None = None
 
     @torch.no_grad()
     def fold(self, lm_head_weight: torch.Tensor) -> None:
@@ -382,6 +387,10 @@ class Inkling2MarkovHead(nn.Module):
         weight = self.rnn_proj.weight[:, : 2 * self.markov_rank]
         raw = torch.addmm(context, inputs, weight.T, out_dtype=torch.float32)
         state, latent = markov_gate(raw, state)
+        if self.vocab_fold_weight is not None:
+            return state, torch.addmm(
+                self.vocab_fold_bias, latent, self.vocab_fold_weight.T
+            )
         return state, torch.addmm(self.fold_bias, latent, self.fold_weight.T)
 
 
@@ -481,6 +490,8 @@ class Inkling2DSparkModel(nn.Module):
             config, vllm_config.model_config.max_model_len, f"{prefix}model"
         )
         self.lm_head: nn.Module | None = None
+        self.draft_vocab: torch.Tensor | None = None
+        self.draft_vocab_head: torch.Tensor | None = None
 
     @torch.no_grad()
     def attach_target(self, target_model: nn.Module) -> None:
@@ -506,6 +517,44 @@ class Inkling2DSparkModel(nn.Module):
         self.model.fuse_alpha.copy_(
             torch.softmax(self.model.fuse_weight.float(), dim=-1)
         )
+        self._refresh_draft_vocab()
+
+    @torch.no_grad()
+    def _refresh_draft_vocab(self) -> None:
+        """Optional draft vocabulary (`VLLM_INKLING2_DRAFT_VOCAB`: a torch file
+        of token ids, most frequent first; the first
+        `VLLM_INKLING2_DRAFT_VOCAB_SIZE` are kept). The drafter's LM-head GEMM,
+        Markov steps and greedy argmax then read those rows only. Draft logits
+        are scattered into a full-vocabulary row of -inf, so the rejection
+        sampler sees the exact proposal distribution: the target's output
+        distribution is unchanged (token-identical at temperature 0); only
+        acceptance can move. Buffers are refilled in place on weight reloads."""
+        path = envs.VLLM_INKLING2_DRAFT_VOCAB
+        if not path:
+            return
+        assert get_tensor_model_parallel_world_size() == 1, (
+            "VLLM_INKLING2_DRAFT_VOCAB supports tensor_parallel_size=1 only"
+        )
+        assert self.lm_head is not None
+        ids = torch.load(path, map_location="cpu", weights_only=True).long()
+        ids = ids[(ids >= 0) & (ids < self.config.vocab_size)]
+        ids = ids[: envs.VLLM_INKLING2_DRAFT_VOCAB_SIZE]
+        assert ids.numel() > 0 and ids.unique().numel() == ids.numel(), (
+            "VLLM_INKLING2_DRAFT_VOCAB must hold distinct in-vocabulary token ids"
+        )
+        weight = self.lm_head.weight
+        head = self.model.markov_head
+        ids = ids.to(weight.device)
+        if self.draft_vocab is None or self.draft_vocab.numel() != ids.numel():
+            self.draft_vocab = ids.clone()
+            self.draft_vocab_head = weight[ids].contiguous()
+            head.vocab_fold_weight = head.fold_weight[ids].contiguous()
+            head.vocab_fold_bias = head.fold_bias[ids].contiguous()
+        else:
+            self.draft_vocab.copy_(ids)
+            self.draft_vocab_head.copy_(weight[ids])
+            head.vocab_fold_weight.copy_(head.fold_weight[ids])
+            head.vocab_fold_bias.copy_(head.fold_bias[ids])
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.attn.layer_name for layer in self.model.layers]
@@ -542,8 +591,11 @@ class Inkling2DSparkModel(nn.Module):
         return self.model(input_ids, positions)
 
     def compute_base_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """TP-local bf16 base logits (bf16 GEMM, as the reference)."""
+        """TP-local bf16 base logits (bf16 GEMM, as the reference); over the
+        draft vocabulary only when one is set."""
         assert self.lm_head is not None
+        if self.draft_vocab_head is not None:
+            return linear(hidden_states, self.draft_vocab_head)
         return linear(hidden_states, self.lm_head.weight)
 
     def markov_step(
@@ -557,6 +609,11 @@ class Inkling2DSparkModel(nn.Module):
     ) -> torch.Tensor:
         """Full-vocab softcapped logits."""
         logits = add_softcap(base_logits, bias, self.config.final_logit_softcapping)
+        if self.draft_vocab is not None:
+            full = logits.new_full(
+                (logits.shape[0], self.config.vocab_size), float("-inf")
+            )
+            return full.index_copy_(1, self.draft_vocab, logits)
         logits = tensor_model_parallel_all_gather(logits)
         return logits[:, : self.config.vocab_size]
 
@@ -564,6 +621,9 @@ class Inkling2DSparkModel(nn.Module):
         self, base_logits: torch.Tensor, bias: torch.Tensor
     ) -> torch.Tensor:
         """`markov_logits(...).argmax(-1)`, NaN as -inf."""
+        if self.draft_vocab is not None:
+            logits = add_softcap(base_logits, bias, self.config.final_logit_softcapping)
+            return self.draft_vocab[greedy_argmax(logits)]
         return greedy_argmax(self.markov_logits(base_logits, bias))
 
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
